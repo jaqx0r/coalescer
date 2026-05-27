@@ -9,7 +9,7 @@
 //
 // If the executing caller's context is cancelled, fn is expected to
 // return ctx.Err().  Concurrent callers waiting for the result will
-// retry fn rather than inherit the cancellation — one of them becomes
+// continue rather than inherit the cancellation — one of them becomes
 // the new leader and executes fn with its own context.
 //
 // Context cancellation of a waiting caller is independent: cancelling

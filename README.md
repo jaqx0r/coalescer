@@ -19,8 +19,8 @@ context.
 ## Behaviour
 
 - **Deduplication**: only one caller executes `fn` per key at a time.
-- **Takeover**: leader ctx cancelled → waiters retry rather than inherit
-  the cancellation.
+- **Takeover**: leader ctx cancelled → a waiter continues rather than
+  inheriting the cancellation.
 - **Independent cancellation**: cancelling one waiter's context never affects
   the leader or other waiters.
 - **Panic isolation**: a panicking `fn` propagates to the leader's caller;
