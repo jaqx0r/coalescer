@@ -36,18 +36,38 @@ package main
 import (
     "context"
     "fmt"
+    "sync"
+    "time"
     "github.com/jaqx0r/coalescer"
 )
 
 func main() {
     c := coalescer.New[string, string]()
     ctx := context.Background()
+    ready := make(chan struct{})
+    var wg sync.WaitGroup
 
-    val, err := c.Do(ctx, "user:42", func(ctx context.Context, key string) (string, error) {
-        return "expensive computation", nil
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        c.Do(ctx, "expensive", func(ctx context.Context, key string) (string, error) {
+            close(ready)
+            time.Sleep(10 * time.Millisecond)
+            return "computed result", nil
+        })
+    }()
+
+    <-ready // caller 1 is inside fn
+
+    val, _ := c.Do(ctx, "expensive", func(ctx context.Context, key string) (string, error) {
+        return "this won't run", nil
     })
-    if err != nil { panic(err) }
-    fmt.Println(val)
+    fmt.Println("caller 2:", val)
+
+    wg.Wait()
+
+    // Output:
+    // caller 2: computed result
 }
 ```
 
