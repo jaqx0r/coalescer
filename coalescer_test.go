@@ -2,14 +2,13 @@ package coalescer_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/jaqx0r/coalescer"
 )
 
@@ -402,7 +401,163 @@ func TestCompareAndDeleteCleanup(t *testing.T) {
 }
 
 func TestSentinelError(t *testing.T) {
-	if diff := cmp.Diff(coalescer.ErrCoalescer, coalescer.ErrCoalescer, cmpopts.EquateErrors()); diff != "" {
-		t.Errorf("ErrCoalescer should match itself: %s", diff)
+	wrapped := fmt.Errorf("outer: %w", coalescer.ErrCoalescer)
+	if !errors.Is(wrapped, coalescer.ErrCoalescer) {
+		t.Error("errors.Is should unwrap ErrCoalescer")
+	}
+	doublyWrapped := fmt.Errorf("top: %w", wrapped)
+	if !errors.Is(doublyWrapped, coalescer.ErrCoalescer) {
+		t.Error("errors.Is should unwrap nested ErrCoalescer")
+	}
+}
+
+func TestForget(t *testing.T) {
+	c := coalescer.New[string, string]()
+	blocked := make(chan struct{})
+	proceed := make(chan struct{})
+
+	// Leader blocks until we say go.
+	go func() {
+		c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+			close(blocked)
+			<-proceed
+			return "leader", nil
+		})
+	}()
+
+	<-blocked
+
+	resultCh := make(chan result[string], 1)
+	go func() {
+		val, err := c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+			return "retry", nil
+		})
+		resultCh <- result[string]{val, err}
+	}()
+
+	// Let waiter attach, then forget.
+	time.Sleep(20 * time.Millisecond)
+	c.Forget("key")
+	close(proceed)
+
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+		if r.val != "retry" {
+			t.Errorf("got %q, want %q", r.val, "retry")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result after Forget")
+	}
+}
+
+func TestForgetRetry(t *testing.T) {
+	c := coalescer.New[string, string]()
+
+	var mu sync.Mutex
+	callCount := 0
+
+	blocked := make(chan struct{})
+	proceed := make(chan struct{})
+
+	go func() {
+		c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+			mu.Lock()
+			callCount++
+			mu.Unlock()
+			close(blocked)
+			<-proceed
+			return "first", nil
+		})
+	}()
+
+	<-blocked
+
+	resultCh := make(chan result[string], 1)
+	go func() {
+		val, err := c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+			mu.Lock()
+			callCount++
+			mu.Unlock()
+			return "second", nil
+		})
+		resultCh <- result[string]{val, err}
+	}()
+
+	// Waiter attaches, then we forget — waiter must retry → second fn call.
+	time.Sleep(20 * time.Millisecond)
+	c.Forget("key")
+	close(proceed)
+
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+		if r.val != "second" {
+			t.Errorf("got %q, want %q", r.val, "second")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	mu.Lock()
+	count := callCount
+	mu.Unlock()
+	if count != 2 {
+		t.Errorf("fn called %d times, want 2", count)
+	}
+}
+
+func TestPanicWrapsError(t *testing.T) {
+	c := coalescer.New[string, string]()
+	blocked := make(chan struct{})
+	leaderDone := make(chan struct{})
+
+	// Leader goroutine — will panic
+	go func() {
+		defer close(leaderDone)
+		defer func() { recover() }()
+		c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+			close(blocked)
+			time.Sleep(50 * time.Millisecond)
+			panic("something went wrong")
+		})
+	}()
+
+	// Wait until leader is in-flight
+	<-blocked
+
+	// Waiter receives error from done channel — no panic here
+	_, err := c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+		return "unreachable", nil
+	})
+	<-leaderDone
+
+	if err == nil {
+		t.Fatal("expected error wrapping ErrCoalescer, got nil")
+	}
+	if !errors.Is(err, coalescer.ErrCoalescer) {
+		t.Errorf("error does not wrap ErrCoalescer: %v", err)
+	}
+	if !strings.Contains(err.Error(), "something went wrong") {
+		t.Errorf("error missing panic message: %v", err)
+	}
+}
+
+func TestForgetNoOp(t *testing.T) {
+	c := coalescer.New[string, string]()
+	// Forget on non-existent key must not panic
+	c.Forget("nonexistent")
+	val, err := c.Do(context.Background(), "key", func(ctx context.Context, key string) (string, error) {
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "ok" {
+		t.Errorf("want ok, got %v", val)
 	}
 }
