@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    tags:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+# None by default.
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+      - run: go test -race ./...
