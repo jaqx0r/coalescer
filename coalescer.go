@@ -29,10 +29,20 @@ import (
 var ErrCoalescer = errors.New("coalescer")
 
 type call[V any] struct {
-	done  chan struct{}
-	val   V
-	err   error
-	retry bool
+	done   chan struct{}
+	val    V
+	err    error
+	retry  bool
+	closed bool
+	mu     sync.Mutex
+}
+
+// closeDone closes the done channel exactly once. Must be called with mu held.
+func (cl *call[V]) closeDone() {
+	if !cl.closed {
+		cl.closed = true
+		close(cl.done)
+	}
 }
 
 type Coalescer[K comparable, V any] struct {
@@ -73,8 +83,10 @@ func (c *Coalescer[K, V]) Do(ctx context.Context, key K, fn func(context.Context
 		)
 
 		if err := ctx.Err(); err != nil {
+			cl.mu.Lock()
 			cl.err = err
-			close(cl.done)
+			cl.closeDone()
+			cl.mu.Unlock()
 			c.inflight.CompareAndDelete(key, cl)
 			var zero V
 			return zero, err
@@ -84,12 +96,16 @@ func (c *Coalescer[K, V]) Do(ctx context.Context, key K, fn func(context.Context
 			if r := recover(); r != nil {
 				panicked = true
 				panicVal = r
-				err = fmt.Errorf("coalescer: panic: %v", r)
+				err = fmt.Errorf("%w: panic: %v", ErrCoalescer, r)
 			}
+			cl.mu.Lock()
 			cl.val = val
 			cl.err = err
-			cl.retry = !panicked && ctx.Err() != nil
-			close(cl.done)
+			if !panicked && ctx.Err() != nil {
+				cl.retry = true
+			}
+			cl.closeDone()
+			cl.mu.Unlock()
 			c.inflight.CompareAndDelete(key, cl)
 			if panicked {
 				panic(panicVal)
@@ -98,5 +114,18 @@ func (c *Coalescer[K, V]) Do(ctx context.Context, key K, fn func(context.Context
 
 		val, err = fn(ctx, key)
 		return val, err
+	}
+}
+
+// Forget evicts the in-flight call for key, if any. Current waiters will
+// retry with a fresh execution; the evicted leader continues but its
+// result is discarded by any waiter that races past Forget.
+func (c *Coalescer[K, V]) Forget(key K) {
+	if v, ok := c.inflight.LoadAndDelete(key); ok {
+		cl := v.(*call[V])
+		cl.mu.Lock()
+		cl.retry = true
+		cl.closeDone()
+		cl.mu.Unlock()
 	}
 }
