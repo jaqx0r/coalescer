@@ -171,6 +171,57 @@ func (c *Coalescer[K, V]) Do(ctx context.Context, key K, fn func(context.Context
 	//   by the number of goroutines; every leader eventually calls closeDone
 	//   (proved below), so the loop terminates given fn terminates and at
 	//   least one non-cancelled goroutine exists (Prop 7).
+	//
+	// ─── Scenario trace: last waiter promoted to leader, ctx cancels ────────
+	//
+	// Setup: goroutines L1, W for the same key k.
+	//   L1 = original leader (ctx_L1 will cancel during fn)
+	//   W  = sole waiter (ctx_W may or may not cancel)
+	//
+	// Trace:
+	//   t0: L1 wins LoadOrStore → leader.  W loads cl → waiter, blocks on <-cl.done.
+	//   t1: ctx_L1 cancels.  fn(ctx_L1, k) returns (val_L1, err_L1).
+	//   t2: L1's defer fires:
+	//         ¬panicked ∧ ctx_L1.Err() != nil → cl.retry = true
+	//         cl.val = val_L1, cl.err = err_L1, closeDone(), CompareAndDelete
+	//         L1 returns (val_L1, err_L1) from line 461.
+	//   t3: W unblocks from <-entry.done.  Sees entry.retry == true → continue.
+	//       W is now the ONLY goroutine in the loop for key k.
+	//   t4: W's LoadOrStore: no entry in inflight → loaded==false.
+	//       W becomes leader.  P_inflight(k, cl_new) ∧ |leaders(k)| = 1.
+	//
+	//   Sub-case A: ctx_W already cancelled at t4:
+	//     t5a: W hits early-exit (line 340): ctx_W.Err() != nil
+	//          cl_new.err = ctx_W.Err(), closeDone(), CompareAndDelete
+	//          W returns (zero, ctx_W.Err()).
+	//     No waiters exist → done channel close observed by nobody.
+	//     POST: W terminates with its own cancellation error. ✓
+	//
+	//   Sub-case B: ctx_W cancels DURING fn(ctx_W, k):
+	//     t5b: fn(ctx_W, k) invoked.  ctx_W cancels at t6 while fn runs.
+	//     t7:  fn returns (val_W, err_W).
+	//     t8:  W's defer fires:
+	//            ¬panicked ∧ ctx_W.Err() != nil → cl_new.retry = true
+	//            cl_new.val = val_W, cl_new.err = err_W
+	//            closeDone(), CompareAndDelete
+	//     t9:  W returns (val_W, err_W) from line 461.
+	//     Retry flag is set but no goroutine observes it (no waiters).
+	//     POST: W terminates with fn's actual result. ✓
+	//
+	//   Sub-case C: ctx_W remains valid throughout:
+	//     t5c: fn(ctx_W, k) invoked and returns (val_W, err_W).
+	//     t6:  W's defer fires:
+	//            ¬panicked ∧ ctx_W.Err() == nil → ¬P_retry(cl_new)
+	//            cl_new.val = val_W, cl_new.err = err_W
+	//            closeDone(), CompareAndDelete
+	//     t7:  W returns (val_W, err_W).
+	//     POST: W terminates with fn's result, no retry. ✓ (normal path)
+	//
+	// Key insight: the leader ALWAYS returns fn's result (or early-exit error)
+	// regardless of retry.  The retry flag is a signal TO WAITERS only.
+	// When |waiters(k)| = 0, retry=true is a dead write — harmless but unobserved.
+	// No leak, no deadlock, no orphaned goroutine.  Prop 7 holds trivially
+	// when the sole goroutine exits (base case: loop terminates by return).
 	for {
 		// Allocate fresh call; done channel open (not closed) at allocation.
 		cl := &call[V]{done: make(chan struct{})}
